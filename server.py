@@ -1,13 +1,14 @@
 """
 GPT Persona MCP Server
 ======================
-페르소나 관리 및 적용 도구
+페르소나 관리 및 적용 도구 + RAG 지식 검색
 
 원본: leaders-decision-assistants (Node.js)
-GPT Desktop용 FastAPI 포팅
+GPT Desktop용 FastAPI 포팅 + ChromaDB RAG
 """
 
 import os
+import sys
 import json
 import logging
 import re
@@ -25,6 +26,126 @@ import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# RAG Vector Store
+# ============================================================================
+
+class PersonaVectorStore:
+    """페르소나 지식 RAG 벡터 스토어"""
+
+    def __init__(self):
+        self.client = None
+        self.collection = None
+        self.model = None
+        self._initialized = False
+        self.db_path = Path(__file__).parent / "data" / "chroma_db"
+
+    def initialize(self):
+        """지연 초기화"""
+        if self._initialized:
+            return
+
+        try:
+            import chromadb
+            from chromadb.config import Settings
+            from sentence_transformers import SentenceTransformer
+
+            if not self.db_path.exists():
+                logger.warning(f"VectorDB not found at {self.db_path}")
+                logger.warning("Run 'python init_vectordb.py' to initialize")
+                return
+
+            # ChromaDB 클라이언트
+            self.client = chromadb.PersistentClient(
+                path=str(self.db_path),
+                settings=Settings(anonymized_telemetry=False)
+            )
+
+            # 컬렉션 가져오기
+            try:
+                self.collection = self.client.get_collection("persona_knowledge")
+                logger.info(f"Vector store loaded: {self.collection.count()} documents")
+            except Exception as e:
+                logger.warning(f"Collection not found: {e}")
+                return
+
+            # 임베딩 모델
+            self.model = SentenceTransformer('all-MiniLM-L6-v2')
+            self._initialized = True
+            logger.info("ChromaDB RAG search enabled")
+
+        except ImportError:
+            logger.warning("chromadb or sentence-transformers not installed")
+            logger.warning("Run: pip install chromadb sentence-transformers")
+        except Exception as e:
+            logger.error(f"Failed to initialize vector store: {e}")
+
+    def search(self, query: str, category: str = None, n_results: int = 5) -> List[Dict]:
+        """시맨틱 검색"""
+        if not self._initialized:
+            self.initialize()
+
+        if not self._initialized or not self.collection:
+            return []
+
+        try:
+            # 쿼리 임베딩
+            query_embedding = self.model.encode([query])[0].tolist()
+
+            # 필터 설정
+            where_filter = None
+            if category and category != "all":
+                where_filter = {"category": {"$eq": category}}
+
+            # 검색
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"]
+            )
+
+            # 결과 포맷
+            formatted = []
+            if results and results["ids"]:
+                for i, doc_id in enumerate(results["ids"][0]):
+                    distance = results["distances"][0][i]
+                    relevance = max(0, 1 - distance)  # distance -> relevance
+
+                    formatted.append({
+                        "id": doc_id,
+                        "content": results["documents"][0][i][:1000] + "..." if len(results["documents"][0][i]) > 1000 else results["documents"][0][i],
+                        "metadata": results["metadatas"][0][i],
+                        "relevance": round(relevance, 3)
+                    })
+
+            return formatted
+
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            return []
+
+    def get_status(self) -> Dict:
+        """벡터 스토어 상태"""
+        if not self._initialized:
+            self.initialize()
+
+        if self._initialized and self.collection:
+            return {
+                "enabled": True,
+                "documents": self.collection.count(),
+                "path": str(self.db_path)
+            }
+        return {
+            "enabled": False,
+            "message": "Run 'python init_vectordb.py' to initialize"
+        }
+
+
+# 전역 벡터 스토어 인스턴스
+vector_store = PersonaVectorStore()
 
 
 # ============================================================================
@@ -229,8 +350,8 @@ persona_manager = PersonaManager()
 
 SERVER_INFO = {
     "name": "gpt-persona-mcp",
-    "version": "1.0.0",
-    "description": "Persona management tool for GPT Desktop"
+    "version": "1.1.1",
+    "description": "Persona management + RAG knowledge search for GPT Desktop (OAuth 2.0)"
 }
 
 TOOLS = [
@@ -322,6 +443,31 @@ TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "search_knowledge",
+        "description": "페르소나 지식베이스를 RAG 검색합니다. 142+ 전문가 페르소나의 지식, 스킬, 전문성을 시맨틱 검색합니다.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "검색할 질문 또는 주제"},
+                "category": {
+                    "type": "string",
+                    "description": "카테고리 필터 (선택): Engineering, Creative, Business, AI-ML, QA, Education, Science, Leadership, Legal, all",
+                    "enum": ["Engineering", "Creative", "Business", "AI-ML", "QA", "Education", "Science", "Leadership", "Legal", "all"]
+                },
+                "n_results": {"type": "integer", "description": "반환할 결과 수 (기본: 5)", "default": 5}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_knowledge_status",
+        "description": "RAG 지식베이스 상태를 확인합니다",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -389,6 +535,37 @@ async def handle_tool_call(name: str, arguments: dict) -> dict:
         analytics = await persona_manager.get_analytics()
         return {"content": [{"type": "text", "text": json.dumps(analytics, indent=2, ensure_ascii=False)}]}
 
+    elif name == "search_knowledge":
+        query = arguments.get("query", "")
+        category = arguments.get("category", "all")
+        n_results = arguments.get("n_results", 5)
+
+        results = vector_store.search(query, category, n_results)
+
+        if results:
+            output = f"## RAG Search Results\n\n**Query**: {query}\n"
+            if category and category != "all":
+                output += f"**Category**: {category}\n"
+            output += f"**Results**: {len(results)}\n\n---\n\n"
+
+            for i, r in enumerate(results, 1):
+                output += f"### {i}. {r['id']} (relevance: {r['relevance']})\n"
+                output += f"**Source**: {r['metadata'].get('source', 'unknown')}\n"
+                output += f"**Category**: {r['metadata'].get('category', 'unknown')}\n\n"
+                output += f"{r['content']}\n\n---\n\n"
+        else:
+            status = vector_store.get_status()
+            if not status.get("enabled"):
+                output = "RAG search not available. Run 'python init_vectordb.py' to initialize."
+            else:
+                output = f"No results found for: {query}"
+
+        return {"content": [{"type": "text", "text": output}]}
+
+    elif name == "get_knowledge_status":
+        status = vector_store.get_status()
+        return {"content": [{"type": "text", "text": json.dumps(status, indent=2, ensure_ascii=False)}]}
+
     else:
         return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
 
@@ -431,6 +608,121 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+# ============================================================================
+# OAuth 2.0 Endpoints for GPT Desktop
+# ============================================================================
+
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_metadata(request: Request):
+    """OAuth 2.0 Authorization Server Metadata"""
+    base_url = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "issuer": base_url,
+        "authorization_endpoint": f"{base_url}/authorize",
+        "token_endpoint": f"{base_url}/token",
+        "registration_endpoint": f"{base_url}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"]
+    })
+
+
+@app.post("/register")
+async def oauth_register(request: Request):
+    """Dynamic Client Registration"""
+    import secrets
+    body = await request.json()
+    client_id = secrets.token_urlsafe(16)
+    client_secret = secrets.token_urlsafe(32)
+
+    return JSONResponse({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_name": body.get("client_name", "GPT Desktop"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_post"
+    })
+
+
+@app.get("/authorize")
+async def oauth_authorize(
+    response_type: str = "code",
+    client_id: str = "",
+    redirect_uri: str = "",
+    state: str = "",
+    code_challenge: str = "",
+    code_challenge_method: str = "S256"
+):
+    """Authorization Endpoint - Auto-approve and redirect"""
+    import secrets
+    from fastapi.responses import RedirectResponse
+
+    # Generate authorization code
+    auth_code = secrets.token_urlsafe(32)
+
+    # Store temporarily (in production, use proper storage)
+    if not hasattr(app, '_auth_codes'):
+        app._auth_codes = {}
+    app._auth_codes[auth_code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge
+    }
+
+    # Redirect back with code
+    separator = "&" if "?" in redirect_uri else "?"
+    redirect_url = f"{redirect_uri}{separator}code={auth_code}"
+    if state:
+        redirect_url += f"&state={state}"
+
+    return RedirectResponse(url=redirect_url)
+
+
+@app.post("/token")
+async def oauth_token(request: Request):
+    """Token Endpoint"""
+    import secrets
+
+    # Parse form data or JSON
+    content_type = request.headers.get("content-type", "")
+    if "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        data = dict(form)
+    else:
+        data = await request.json()
+
+    grant_type = data.get("grant_type")
+
+    if grant_type == "authorization_code":
+        # Exchange code for tokens
+        access_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
+
+        return JSONResponse({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh_token
+        })
+
+    elif grant_type == "refresh_token":
+        # Refresh tokens
+        access_token = secrets.token_urlsafe(32)
+
+        return JSONResponse({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })
+
+    return JSONResponse({
+        "error": "unsupported_grant_type"
+    }, status_code=400)
 
 
 @app.post("/mcp")
